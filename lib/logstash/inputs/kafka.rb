@@ -13,7 +13,8 @@ require 'stud/interval'
 # [options="header"]
 # |==========================================================
 # |Kafka Broker Version |Kafka Client Version |Logstash Version |Plugin Version |Why?
-# |0.8       |0.8       |2.0.0 - 2.x.x   |<3.0.0 |Legacy, 0.8 is still popular
+# |0.8       |0.8       |2.0.0 - 2.x.x   |<2.10.0 |Legacy, 0.8 is still popular
+# |0.8       |0.8       |2.0.0 - 2.x.x   | 2.10.x |Version 2.9 made compatible with LS5. Works with the new getter/setter APIs (`event.set('[product][price]', 10)`) but uses the old kafka lib from the 2.x branch
 # |0.9       |0.9       |2.0.0 - 2.3.x   | 3.x.x |Works with the old Ruby Event API (`event['product']['price'] = 10`)
 # |0.9       |0.9       |2.4.0 - 5.0.x   | 4.x.x |Works with the new getter/setter APIs (`event.set('[product][price]', 10)`)
 # |0.10      |0.10      |2.4.0 - 5.0.x   | 5.x.x |Not compatible with the 0.9 broker
@@ -115,7 +116,10 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
 
   public
   def register
-    LogStash::Logger.setup_log4j(@logger)
+     # Logstash 2.4
+    if defined?(LogStash::Logger) && LogStash::Logger.respond_to?(:setup_log4j)
+      LogStash::Logger.setup_log4j(@logger)
+    end
     options = {
         :zk_connect => @zk_connect,
         :group_id => @group_id,
@@ -198,12 +202,12 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
       @codec.decode("#{message_and_metadata.message}") do |event|
         decorate(event)
         if @decorate_events
-          event['kafka'] = {'msg_size' => message_and_metadata.message.size,
+          event.set('kafka', {'msg_size' => message_and_metadata.message.size,
                             'topic' => message_and_metadata.topic,
                             'consumer_group' => @group_id,
                             'partition' => message_and_metadata.partition,
                             'offset' => message_and_metadata.offset,
-                            'key' => message_and_metadata.key}
+                            'key' => message_and_metadata.key} )
         end
         output_queue << event
       end # @codec.decode
