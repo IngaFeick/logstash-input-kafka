@@ -120,11 +120,10 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
 
   public
   def register
-     # Logstash 2.4
-    if defined?(LogStash::Logger) && LogStash::Logger.respond_to?(:setup_log4j)
-      LogStash::Logger.setup_log4j(@logger)
-    end
-    options = {
+    java_import 'kafka.common.ConsumerRebalanceFailedException'
+    @runner_threads = []
+    @logger.info('Registering kafka', :group_id => @group_id, :topic_id => @topic_id, :zk_connect => @zk_connect)
+    @kf_options = {
         :zk_connect => @zk_connect,
         :group_id => @group_id,
         :topic_id => @topic_id,
@@ -135,7 +134,6 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
         :consumer_timeout_ms => @consumer_timeout_ms,
         :consumer_restart_on_error => @consumer_restart_on_error,
         :consumer_restart_sleep_ms => @consumer_restart_sleep_ms,
-        :consumer_id => @consumer_id,
         :fetch_message_max_bytes => @fetch_message_max_bytes,
         :allow_topics => @white_list,
         :filter_topics => @black_list,
@@ -143,7 +141,7 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
         :key_decoder_class => @key_decoder_class
     }
     if @reset_beginning
-      options[:reset_beginning] = 'from-beginning'
+      @kf_options[:reset_beginning] = 'from-beginning'
     end # if :reset_beginning
     topic_or_filter = [@topic_id, @white_list, @black_list].compact
     if topic_or_filter.count == 0
@@ -151,95 +149,140 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
     elsif topic_or_filter.count > 1
       raise LogStash::ConfigurationError, 'Invalid combination of topic_id, white_list or black_list. Use only one.'
     end
-    @kafka_client_queue = SizedQueue.new(@queue_size)
-    @consumer_group = create_consumer_group(options)
-    @logger.info('Registering kafka', :group_id => @group_id, :topic_id => @topic_id, :zk_connect => @zk_connect)
-    @thread_pool = Thread.pool @thread_pool_size
+   
   end # def register
 
   public
   def run(logstash_queue)
-    # noinspection JRubyStringImportInspection
-    java_import 'kafka.common.ConsumerRebalanceFailedException'
-    @logger.info('Running kafka', :group_id => @group_id, :topic_id => @topic_id, :zk_connect => @zk_connect)
+    @runner_consumers = @consumer_threads.times.map { |i| create_consumer("#{i}") }
+    @runner_threads = @runner_consumers.each_with_index.map { |consumer,i| thread_runner(logstash_queue, consumer,i) }
+    @runner_threads.each { |t| t.join }
+  end
+
+  public
+  def kafka_consumers
+    @runner_consumers
+  end
+
+  private
+  def create_consumer(client_id)
     begin
-      @consumer_group.run(@consumer_threads,@kafka_client_queue)
-
-      while !stop?
-        event = @kafka_client_queue.pop
-        if event == KAFKA_SHUTDOWN_EVENT
-          break
-        end
-        queue_event(event, logstash_queue)
-      end
-
-      until @kafka_client_queue.empty?
-        event = @kafka_client_queue.pop
-        if event == KAFKA_SHUTDOWN_EVENT
-          break
-        end
-        queue_event(event, logstash_queue)
-      end
-
-      @logger.info('Done running kafka input')
+      options = @kf_options.clone
+      options[:consumer_id ] = @consumer_id + "-" + client_id
+      Kafka::Group.new(options) 
     rescue => e
-      @logger.warn('kafka client threw exception, restarting',
-                   :exception => e)
-      Stud.stoppable_sleep(Float(@consumer_restart_sleep_ms) * 1 / 1000) { stop? }
-      retry if !stop?
+      logger.error("Unable to create Kafka consumer from given configuration",
+                   :kafka_error_message => e,
+                   :cause => e.respond_to?(:getCause) ? e.getCause() : nil)
+      throw e
     end
-  end # def run
+  end
+
+
+
+  private
+  def thread_runner(logstash_queue, consumer, threadnumber)
+  
+    Thread.new do
+      @logger.info("Starting kafka thread #{threadnumber}")
+      begin 
+        kafka_client_queue = SizedQueue.new(@queue_size)
+        consumer.run(1, kafka_client_queue)
+        
+        codec_instance = @codec.clone
+        while !stop?
+          message_and_metadata = kafka_client_queue.pop
+          if message_and_metadata == KAFKA_SHUTDOWN_EVENT
+            break
+          end
+          queue_event(message_and_metadata, logstash_queue, codec_instance)
+        end
+
+        until @kafka_client_queue.empty?
+          message_and_metadata = @kafka_client_queue.pop
+          if message_and_metadata == KAFKA_SHUTDOWN_EVENT
+            break
+          end
+          queue_event(message_and_metadata, logstash_queue, codec_instance)
+        end          
+
+      rescue => e
+        # raise e if !stop?
+        @logger.warn('kafka client threw exception, restarting',
+                   :exception => e)
+        Stud.stoppable_sleep(Float(@consumer_restart_sleep_ms) * 1 / 1000) { stop? }
+        retry if !stop?
+      ensure
+        consumer.shutdown if consumer.running?
+      end
+    end
+  end
+
+  private 
+  def queue_event(message_and_metadata, logstash_queue, codec_instance)
+    begin
+      codec_instance.decode("#{message_and_metadata.message}") do |event|
+        decorate(event)
+        if @decorate_events
+          event.set("[@metadata][kafka][topic]", record.topic)
+          event.set("[@metadata][kafka][consumer_group]", @group_id)
+          event.set("[@metadata][kafka][partition]", record.partition)
+          event.set("[@metadata][kafka][offset]", record.offset)
+          event.set("[@metadata][kafka][key]", record.key)
+          event.set("[@metadata][kafka][timestamp]", record.timestamp)
+        end
+        logstash_queue << event
+      end # do
+    end # begin
+  end # def
 
   public
   def stop
+    @runner_consumers.each { |c| c.shutdown if c.running? }
     @kafka_client_queue.push(KAFKA_SHUTDOWN_EVENT)
-    @consumer_group.shutdown if @consumer_group.running?
   end
 
-  public
-  def receive_from_codec(event, message_and_metadata, output_queue)
-    begin
-      decorate(event)
-      if @decorate_events
-        event.set('kafka', {'msg_size' => message_and_metadata.message.size,
-                          'topic' => message_and_metadata.topic,
-                          'consumer_group' => @group_id,
-                          'partition' => message_and_metadata.partition,
-                          'offset' => message_and_metadata.offset,
-                          'key' => message_and_metadata.key} )
-      end
-      output_queue << event
-    rescue => e # parse or event creation error
-      @logger.error('Failed to create event', :message => "#{message_and_metadata.message}", :exception => e,
-                    :backtrace => e.backtrace)
-    end # begin
-  end
+  # public
+  # def receive_from_codec(event, message_and_metadata, output_queue)
+  #   begin
+  #     decorate(event)
+  #     if @decorate_events
+  #       event.set('kafka', {'msg_size' => message_and_metadata.message.size,
+  #                         'topic' => message_and_metadata.topic,
+  #                         'consumer_group' => @group_id,
+  #                         'partition' => message_and_metadata.partition,
+  #                         'offset' => message_and_metadata.offset,
+  #                         'key' => message_and_metadata.key} )
+  #     end
+  #     output_queue << event
+  #   rescue => e # parse or event creation error
+  #     @logger.error('Failed to create event', :message => "#{message_and_metadata.message}", :exception => e,
+  #                   :backtrace => e.backtrace)
+  #   end # begin
+  # end
 
-  private
-  def create_consumer_group(options)
-    Kafka::Group.new(options)
-  end
 
-  private
-  def queue_event(message_and_metadata, output_queue)
-    @thread_pool.future {
-        s =DecoderThread.new
-        s.decode(self, @codec.clone, message_and_metadata, output_queue, @logger)        
-    }
-  end # def queue_event
+
+  # private
+  # def queue_event(message_and_metadata, output_queue)
+  #   @thread_pool.future {
+  #       s =DecoderThread.new
+  #       s.decode(self, @codec.clone, message_and_metadata, output_queue, @logger)        
+  #   }
+  # end # def queue_event
 end #class LogStash::Inputs::Kafka
 
 
-class DecoderThread
+# class DecoderThread
 
-  def decode(kafka_input, codec, message_and_metadata, output_queue, logger)
-    begin
-      codec.decode("#{message_and_metadata.message}") do |event|
-        kafka_input.receive_from_codec(event, message_and_metadata, output_queue)
-      end # @codec.decode
-    rescue => e # parse or event creation error
-      logger.error('Failed to create event', :message => "#{message_and_metadata.message}", :exception => e,
-                    :backtrace => e.backtrace)
-    end # begin
-  end # decode
-end # class DecoderThread
+#   def decode(kafka_input, codec, message_and_metadata, output_queue, logger)
+#     begin
+#       codec.decode("#{message_and_metadata.message}") do |event|
+#         kafka_input.receive_from_codec(event, message_and_metadata, output_queue)
+#       end # @codec.decode
+#     rescue => e # parse or event creation error
+#       logger.error('Failed to create event', :message => "#{message_and_metadata.message}", :exception => e,
+#                     :backtrace => e.backtrace)
+#     end # begin
+#   end # decode
+# end # class DecoderThread
