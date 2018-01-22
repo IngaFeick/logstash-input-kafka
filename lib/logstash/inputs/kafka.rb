@@ -196,6 +196,25 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
     @consumer_group.shutdown if @consumer_group.running?
   end
 
+  public
+  def receive_from_codec(event, message_and_metadata, output_queue)
+    begin
+      decorate(event)
+      if @decorate_events
+        event.set('kafka', {'msg_size' => message_and_metadata.message.size,
+                          'topic' => message_and_metadata.topic,
+                          'consumer_group' => @group_id,
+                          'partition' => message_and_metadata.partition,
+                          'offset' => message_and_metadata.offset,
+                          'key' => message_and_metadata.key} )
+      end
+      output_queue << event
+    rescue => e # parse or event creation error
+      @logger.error('Failed to create event', :message => "#{message_and_metadata.message}", :exception => e,
+                    :backtrace => e.backtrace)
+    end # begin
+  end
+
   private
   def create_consumer_group(options)
     Kafka::Group.new(options)
@@ -205,27 +224,18 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
   def queue_event(message_and_metadata, output_queue)
     @thread_pool.future {
         s =DecoderThread.new
-        s.decode(self, @codec, message_and_metadata, output_queue, @decorate_events, @logger)        
-     }
+        s.decode(self, @codec.clone, message_and_metadata, output_queue, @logger)        
+    }
   end # def queue_event
 end #class LogStash::Inputs::Kafka
 
 
 class DecoderThread
 
-  def decode(kafka_input, codec, message_and_metadata, output_queue, decorate_events, logger)
+  def decode(kafka_input, codec, message_and_metadata, output_queue, logger)
     begin
       codec.decode("#{message_and_metadata.message}") do |event|
-        kafka_input.decorate(event)
-        if decorate_events
-          event.set('kafka', {'msg_size' => message_and_metadata.message.size,
-                            'topic' => message_and_metadata.topic,
-                            'consumer_group' => @group_id,
-                            'partition' => message_and_metadata.partition,
-                            'offset' => message_and_metadata.offset,
-                            'key' => message_and_metadata.key} )
-        end
-        output_queue << event
+        kafka_input.receive_from_codec(event, message_and_metadata, output_queue)
       end # @codec.decode
     rescue => e # parse or event creation error
       logger.error('Failed to create event', :message => "#{message_and_metadata.message}", :exception => e,
