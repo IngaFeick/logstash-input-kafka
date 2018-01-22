@@ -1,3 +1,9 @@
+# 2.0.11
+ - multithread the codec application b/c some codecs might be very slow (protobuf decoding)
+
+# 2.0.10
+ - Make compatible with logstash 5, because some of us still need support for kafka 0.8
+
 # 2.0.9
  - Fix shutdown sequence bug where a shutdown event found itself in queue after a shutdown was initiated
 

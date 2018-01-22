@@ -2,6 +2,8 @@ require 'logstash/namespace'
 require 'logstash/inputs/base'
 require 'jruby-kafka'
 require 'stud/interval'
+require 'thread/pool'
+require 'thread/future'
 
 # This input will read events from a Kafka topic. It uses the high level consumer API provided
 # by Kafka to read messages from the broker. It also maintains the state of what has been
@@ -111,6 +113,8 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
   # The serializer class for keys (defaults to the same default as for messages)
   config :key_decoder_class, :validate => :string, :default => 'kafka.serializer.DefaultDecoder'
 
+  config :thread_pool_size, :validate => :number, :default => 4
+
   class KafkaShutdownEvent; end
   KAFKA_SHUTDOWN_EVENT = KafkaShutdownEvent.new
 
@@ -150,6 +154,7 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
     @kafka_client_queue = SizedQueue.new(@queue_size)
     @consumer_group = create_consumer_group(options)
     @logger.info('Registering kafka', :group_id => @group_id, :topic_id => @topic_id, :zk_connect => @zk_connect)
+    @thread_pool = Thread.pool @thread_pool_size
   end # def register
 
   public
@@ -198,10 +203,21 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
 
   private
   def queue_event(message_and_metadata, output_queue)
+    @thread_pool.future {
+        s =DecoderThread.new
+        s.decode(self, @codec, message_and_metadata, output_queue, @decorate_events, @logger)        
+     }
+  end # def queue_event
+end #class LogStash::Inputs::Kafka
+
+
+class DecoderThread
+
+  def decode(kafka_input, codec, message_and_metadata, output_queue, decorate_events, logger)
     begin
-      @codec.decode("#{message_and_metadata.message}") do |event|
-        decorate(event)
-        if @decorate_events
+      codec.decode("#{message_and_metadata.message}") do |event|
+        kafka_input.decorate(event)
+        if decorate_events
           event.set('kafka', {'msg_size' => message_and_metadata.message.size,
                             'topic' => message_and_metadata.topic,
                             'consumer_group' => @group_id,
@@ -212,8 +228,8 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
         output_queue << event
       end # @codec.decode
     rescue => e # parse or event creation error
-      @logger.error('Failed to create event', :message => "#{message_and_metadata.message}", :exception => e,
+      logger.error('Failed to create event', :message => "#{message_and_metadata.message}", :exception => e,
                     :backtrace => e.backtrace)
     end # begin
-  end # def queue_event
-end #class LogStash::Inputs::Kafka
+  end # decode
+end # class DecoderThread
