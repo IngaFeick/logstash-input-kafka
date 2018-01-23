@@ -198,8 +198,8 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
           queue_event(message_and_metadata, logstash_queue, codec_instance)
         end
 
-        until @kafka_client_queue.empty?
-          message_and_metadata = @kafka_client_queue.pop
+        until kafka_client_queue.empty?
+          message_and_metadata = kafka_client_queue.pop
           if message_and_metadata == KAFKA_SHUTDOWN_EVENT
             break
           end
@@ -208,10 +208,11 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
 
       rescue => e
         # raise e if !stop?
-        @logger.warn('kafka client threw exception, restarting',
-                   :exception => e)
-        Stud.stoppable_sleep(Float(@consumer_restart_sleep_ms) * 1 / 1000) { stop? }
-        retry if !stop?
+        # OR
+        # @logger.warn('kafka client threw exception, restarting',
+        #            :exception => e)
+        # Stud.stoppable_sleep(Float(@consumer_restart_sleep_ms) * 1 / 1000) { stop? }
+        # retry if !stop?
       ensure
         consumer.shutdown if consumer.running?
       end
