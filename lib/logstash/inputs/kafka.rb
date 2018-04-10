@@ -240,7 +240,10 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
   public
   def stop
     @runner_consumers.each { |c| c.shutdown if c.running? }
-    @kafka_client_queue.push(KAFKA_SHUTDOWN_EVENT)
+    # @kafka_client_queue.push(KAFKA_SHUTDOWN_EVENT) 
+    # ^ TODO the queues have been moved into anonymous threads and we do not currently have a way of reaching them. 
+    # Since we're not experiencing any problems during shutdown we'll not refactor this whole thing, as the migration 
+    # to the official current version of this plugin is imminent.
   end
 
   # public

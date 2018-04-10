@@ -1,3 +1,6 @@
+# 2.0.12
+ - remove error message on shutdown
+
 # 2.0.11
  - multithread the codec application b/c some codecs might be very slow (protobuf decoding)
 
